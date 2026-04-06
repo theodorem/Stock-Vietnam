@@ -248,13 +248,29 @@ def job_update_tudoanh():
     if is_weekend(): return
 
     MASTER_FILE = os.path.join(TD_DIR, "tudoanh_all.csv")
-    urls = [
+    
+    # 1. Danh sách URL trực tiếp (Sẽ chạy rất nhanh nếu chạy ở local)
+    base_urls = [
         "https://histdatafeed.vps.com.vn/proprietary/snapshot/TOTAL",
         "https://histdatafeed.vps.com.vn/proprietary/snapshot/total",
         "https://bgapidatafeed.vps.com.vn/proprietary/snapshot/TOTAL",
     ]
     
+    # 2. Danh sách CORS Proxy miễn phí để bypass chặn IP trên GitHub Actions
+    proxy_prefixes = [
+        "https://api.codetabs.com/v1/proxy?quest=",
+        "https://api.allorigins.win/raw?url="
+    ]
+    
+    # 3. Tạo danh sách URL tổng hợp: Đưa URL trực tiếp lên đầu, sau đó mới đến Proxy
+    urls = base_urls.copy()
+    for prefix in proxy_prefixes:
+        for base in base_urls:
+            urls.append(f"{prefix}{base}")
+    
     try:
+        # fetch_json_with_fallback sẽ thử lần lượt. 
+        # Nếu GitHub bị timeout ở 3 link đầu, nó sẽ tự động thử link có proxy.
         data = fetch_json_with_fallback(urls, max_retries=4, connect_timeout=10, read_timeout=45)
         data = data.get("data", []) if isinstance(data, dict) else data
         if not data:
