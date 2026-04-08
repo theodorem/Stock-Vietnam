@@ -1,4 +1,5 @@
 import os
+import sys
 import requests
 import pandas as pd
 import datetime as dt
@@ -8,6 +9,15 @@ import uuid
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.exceptions import RequestException, Timeout
+
+# Ensure Windows terminal can print Unicode logs (emoji/Vietnamese) safely
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # ==============================================================================
 # CẤU HÌNH CHUNG & ĐƯỜNG DẪN
@@ -35,6 +45,31 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Connection": "keep-alive"
 }
+
+# ==============================================================================
+# TELEGRAM NOTIFICATION CONFIG (FILL THESE LATER)
+# ==============================================================================
+TELEGRAM_BOT_TOKEN = "8556290396:AAHOMkTJCPc1ifAYJOuv9EkrYeOrEiyLbz4"
+TELEGRAM_CHAT_ID = "8524560136"
+
+
+def send_telegram_message(message):
+    """Send a Telegram message when bot token/chat id are configured."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(" Telegram chưa cấu hình (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID). Bỏ qua gửi thông báo.")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        r.raise_for_status()
+        print(" Đã gửi thông báo Telegram.")
+    except Exception as e:
+        print(f"❌ Gửi Telegram thất bại: {e}")
 
 def fetch_with_retry(url, max_retries=3, timeout=30):
     """Fetch URL with retry logic and exponential backoff."""
@@ -566,19 +601,44 @@ def job_update_tick_data():
 # MAIN EXECUTION
 # ==============================================================================
 if __name__ == "__main__":
-    try: job_update_prices()
-    except Exception as e: print(f"❌ ERROR JOB 1: {e}")
+    jobs = [
+        ("JOB 1 - CAP NHAT GIA & NUOC NGOAI", job_update_prices),
+        ("JOB 2 - CAP NHAT THOA THUAN", job_update_putthrough),
+        ("JOB 3 - CAP NHAT TU DOANH", job_update_tudoanh),
+        ("JOB 4 - CAP NHAT CHI SO (VNINDEX)", job_update_index),
+        ("JOB 5 - CAP NHAT TICK DATA", job_update_tick_data),
+    ]
 
-    try: job_update_putthrough()
-    except Exception as e: print(f"❌ ERROR JOB 2: {e}")
+    job_results = []
 
-    try: job_update_tudoanh()
-    except Exception as e: print(f"❌ ERROR JOB 3: {e}")
-    
-    try: job_update_index()
-    except Exception as e: print(f"❌ ERROR JOB 4: {e}")
-
-    try: job_update_tick_data()
-    except Exception as e: print(f"ERROR JOB 5: {e}")
+    for job_name, job_func in jobs:
+        try:
+            job_func()
+            job_results.append((job_name, "OK", ""))
+        except Exception as e:
+            err = str(e)
+            print(f"ERROR {job_name}: {err}")
+            job_results.append((job_name, "FAILED", err))
 
     print("\nHOAN TAT TOAN BO QUA TRINH UPDATE!")
+
+    failed_jobs = [j for j in job_results if j[1] == "FAILED"]
+    done_time = dt.datetime.now(VN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+    if failed_jobs:
+        fail_lines = "\n".join([f"- {name}: {err}" for name, _, err in failed_jobs])
+        telegram_msg = (
+            "⚠️ DAILY UPDATE HOAN TAT (CO LOI)\n"
+            f"Thoi gian: {done_time} (VN)\n"
+            f"So job loi: {len(failed_jobs)}/{len(job_results)}\n"
+            "Chi tiet:\n"
+            f"{fail_lines}"
+        )
+    else:
+        telegram_msg = (
+            "✅ DAILY UPDATE HOAN TAT\n"
+            f"Thoi gian: {done_time} (VN)\n"
+            f"Tat ca {len(job_results)} job deu thanh cong."
+        )
+
+    send_telegram_message(telegram_msg)
