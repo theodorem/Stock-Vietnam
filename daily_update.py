@@ -49,8 +49,8 @@ HEADERS = {
 # ==============================================================================
 # TELEGRAM NOTIFICATION CONFIG (FILL THESE LATER)
 # ==============================================================================
-TELEGRAM_BOT_TOKEN = "8556290396:AAHOMkTJCPc1ifAYJOuv9EkrYeOrEiyLbz4"
-TELEGRAM_CHAT_ID = "8524560136"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 
 def send_telegram_message(message):
