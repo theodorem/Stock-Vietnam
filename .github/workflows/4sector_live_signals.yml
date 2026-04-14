@@ -2,9 +2,6 @@ name: 4Sector Live Signals + Telegram
 
 on:
   workflow_dispatch:
-  schedule:
-    # 14:30 UTC weekdays (adjust as needed)
-    - cron: "30 14 * * 1-5"
 
 jobs:
   run-signals:
