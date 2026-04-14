@@ -31,43 +31,54 @@ warnings.filterwarnings("ignore")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Telegram (GitHub-safe: secrets come from environment variables)
+# ── Telegram config (secrets from environment variables) ──────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "").strip()
 TELEGRAM_ENABLED   = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
 
 def send_telegram_message(message):
-    """
-    Send a plain text message to Telegram using Bot API.
-    Reads token/chat_id from environment variables:
-      - TELEGRAM_BOT_TOKEN
-      - TELEGRAM_CHAT_ID
-    """
     if not TELEGRAM_ENABLED:
         print("[Telegram] Not configured (missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).")
         return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": True,
-    }
-    data = urllib.parse.urlencode(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
-
+    url     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message,
+                "disable_web_page_preview": True}
+    data    = urllib.parse.urlencode(payload).encode("utf-8")
+    req     = urllib.request.Request(url, data=data, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             ok = 200 <= getattr(resp, "status", 200) < 300
-            if ok:
-                print("[Telegram] Message sent.")
-            else:
-                print(f"[Telegram] HTTP status: {getattr(resp, 'status', 'unknown')}")
+            print(f"[Telegram] {'Sent' if ok else 'HTTP ' + str(getattr(resp,'status','?'))}")
             return ok
     except Exception as exc:
         print(f"[Telegram] Send failed: {exc}")
         return False
+
+
+def send_telegram_report_chunks(lines, header="4Sector Live Signals"):
+    if not TELEGRAM_ENABLED:
+        print("[Telegram] Not configured.")
+        return False
+    text    = "\n".join(lines).strip()
+    if not text:
+        return send_telegram_message(f"{header}\n(no content)")
+    max_len = 3500
+    chunks, current, current_len = [], [], 0
+    for line in text.splitlines():
+        add = len(line) + 1
+        if current and current_len + add > max_len:
+            chunks.append("\n".join(current))
+            current, current_len = [line], add
+        else:
+            current.append(line); current_len += add
+    if current:
+        chunks.append("\n".join(current))
+    ok_all = True
+    for i, chunk in enumerate(chunks, 1):
+        ok_all = send_telegram_message(f"{header} ({i}/{len(chunks)})\n\n{chunk}") and ok_all
+    return ok_all
+
 
 try:
     # Avoid Windows cp1252 console crashes when printing Unicode box characters
@@ -168,18 +179,46 @@ FRICTION            = 0.0025
 EARLY_V3_THRESHOLD  = -10.0   # spread floor for early entry
 EARLY_V3_VEL_DAYS   =  3      # consecutive days velocity > 0 required
 
+# ── Demand-early entry (stock-flow based pre-signal) ─────────────
+# Fires when sector heat (avg full-candle score of liquid stocks)
+# exceeds threshold while sector is still DROWNING.
+# WFO validated: 5/5 windows beat baseline Sharpe.
+DEMAND_EARLY_ENABLED     = True
+DEMAND_HEAT_WINDOW       = 20
+DEMAND_HEAT_THRESHOLD    = 0.012   # fallback when history too short
+DEMAND_HEAT_SPREAD_FLOOR = -15.0
+# Adaptive threshold: fire when heat > Nth-pct of own 252-day history.
+# Self-calibrates to market regime — low-vol periods lower the bar,
+# high-vol periods raise it.
+DEMAND_HEAT_USE_ADAPTIVE = True
+DEMAND_HEAT_PERCENTILE   = 75   # top 25% of own history = genuine anomaly
+DEMAND_HEAT_MIN_HISTORY  = 60   # min points before adaptive threshold kicks in
+DEMAND_HEAT_HISTORY_DAYS = 252  # rolling look-back for percentile computation
+# Late-entry momentum filter for DEMAND_EARLY stock selection:
+# When DEMAND fires, some stocks have already moved a lot (they drove the heat).
+# This cap skips stocks with >15% 20d momentum, leaving only laggards that
+# haven't run yet — better risk/reward since full TP upside is still available.
+# Set to None to disable and show all stocks.
+DEMAND_EARLY_MAX_MOM_PCT = 0.15
+
 # ── Per-sector stock selection (volume experiment results) ────────
 # Banks:           MOM_BOT50  — vol metrics hurt (macro/news driven, stocks move together)
 # Basic Resources: VOL_LEADERS — top 5 by vol_score; win rate 39.8% → 50.8%
 # Food & Beverage: VOL_RANK   — top 50% by vol_score; win rate 41.3% → 50.0%
-# Real Estate:     VOL_RANK   — top 50% by vol_score
+# Real Estate:     VOL_LEADERS N=12 — top 12 by full-candle score; +21% total return
+#                                      vs static vol_score, win rate 67%, avg +14.2%
 SECTOR_STOCK_SELECTION = {
     "Banks":           "MOM_BOT50",
     "Basic Resources": "VOL_LEADERS",
     "Food & Beverage": "VOL_RANK",
-    "Real Estate":     "VOL_RANK",
+    "Real Estate":     "VOL_LEADERS",
 }
-VOL_LEADERS_N = 5
+VOL_LEADERS_N = 12
+# Rank VOL_LEADERS by recent full-body candle score (body_pct × body_ratio,
+# recency-weighted) — picks stocks with a strong recent conviction buying
+# session rather than accumulated historical flow.
+FULL_CANDLE_WINDOW          = 10
+VOL_LEADERS_USE_FULL_CANDLE = True
 
 TRANCHE1_FRAC = 0.50
 TRANCHE2_FRAC = 0.50
@@ -221,6 +260,9 @@ def load_data():
             df = df[(df["close"] > 0) & (df["open"] > 0)]
             df = df[df.index <= pd.Timestamp.today()]
             if len(df) < 60: continue
+            # Liquidity filter — match backtest universe (≥1B VND median daily turnover)
+            med_to = (df["close"] * df["volume"] * 1000).tail(60).median()
+            if med_to < MIN_LIQUIDITY_VND: continue
             stock_data[ticker] = df
             sec = ticker_to_sector[ticker]
             sector_data.setdefault(sec, {})[ticker] = df
@@ -381,6 +423,67 @@ def entry_ok(row, sector):
     return False
 
 
+def _demand_heat(sector_stocks, as_of_date, window=None):
+    """Avg full-candle score across liquid stocks — sector heat for DEMAND_EARLY."""
+    if window is None:
+        window = DEMAND_HEAT_WINDOW
+    scores = []
+    for ticker, df in sector_stocks.items():
+        hist = df[df.index <= as_of_date]
+        med_to = (hist["close"] * hist["volume"] * 1000).tail(60).median()
+        if med_to < MIN_LIQUIDITY_VND:
+            continue
+        recent = hist.tail(window)
+        if (recent["volume"] > 0).sum() < int(window * 0.75):
+            continue
+        fc = _full_candle_score_from_df(df, as_of_date, window=window)
+        if not np.isnan(fc):
+            scores.append(fc)
+    if not scores:
+        return 0.0
+    scores.sort(reverse=True)
+    return float(np.mean(scores[:max(len(scores) // 2, 1)]))
+
+
+def _adaptive_heat_threshold(sector_stocks, as_of_date, window=None,
+                              history_days=None, percentile=None, sample_every=5):
+    """
+    Compute the adaptive demand threshold for a sector as of as_of_date.
+
+    Samples heat scores at `sample_every`-day intervals over the past
+    `history_days` trading days, then returns the Nth percentile.
+
+    Falls back to DEMAND_HEAT_THRESHOLD when insufficient history.
+    """
+    if not DEMAND_HEAT_USE_ADAPTIVE:
+        return DEMAND_HEAT_THRESHOLD
+    if window is None:
+        window = DEMAND_HEAT_WINDOW
+    if history_days is None:
+        history_days = DEMAND_HEAT_HISTORY_DAYS
+    if percentile is None:
+        percentile = DEMAND_HEAT_PERCENTILE
+
+    # Build a date index from available data in this sector
+    all_dates_in_sec = sorted(set().union(
+        *[set(df.index[df.index <= as_of_date]) for df in sector_stocks.values()]
+    ))
+    # Take rolling window and sample every N days
+    hist_window = [d for d in all_dates_in_sec
+                   if d <= as_of_date][-history_days:]
+    sample_dates = hist_window[::sample_every]
+
+    heat_hist = []
+    for dt in sample_dates:
+        h = _demand_heat(sector_stocks, dt, window=window)
+        heat_hist.append(h)
+
+    if len(heat_hist) < DEMAND_HEAT_MIN_HISTORY // sample_every:
+        return DEMAND_HEAT_THRESHOLD
+
+    return float(np.percentile(heat_hist, percentile))
+
+
 def entry_ok_early(row, sector):
     """
     EARLY_V3: fires while sector is still DROWNING.
@@ -397,6 +500,33 @@ def entry_ok_early(row, sector):
     if float(row["spread"]) < EARLY_V3_THRESHOLD: return False
     if int(row.get("rising_streak", 0)) < EARLY_V3_VEL_DAYS: return False
     return True
+
+
+def _full_candle_score_from_df(df, as_of_date, window=None):
+    """
+    Recent full-body candle score (no lookahead).
+    body_pct × body_ratio per bullish bar, recency-weighted average.
+    Requires high/low columns; returns np.nan if unavailable.
+    """
+    if window is None:
+        window = FULL_CANDLE_WINDOW
+    hist = df[df.index < as_of_date].tail(window)
+    if len(hist) < 3:
+        return np.nan
+    if "high" not in hist.columns or "low" not in hist.columns:
+        return np.nan
+    scores = []
+    for _, row in hist.iterrows():
+        body = row["close"] - row["open"]
+        rng  = row["high"]  - row["low"]
+        if body <= 0 or rng <= 0 or row["open"] <= 0:
+            scores.append(0.0)
+            continue
+        scores.append((body / row["open"]) * (body / rng))
+    if not scores:
+        return np.nan
+    weights = np.arange(1, len(scores) + 1, dtype=float)
+    return float(np.average(scores, weights=weights))
 
 
 def _vol_score_from_df(df, as_of_date):
@@ -467,7 +597,7 @@ def exit_needed(row):
 # ═════════════════════════════════════════════════════════════════
 
 def select_stocks(sector_stocks, available_cash, latest_date, sector=None,
-                  stock_data_all=None):
+                  stock_data_all=None, demand_mode=False):
     # stock_data_all used for Kijun lookup (has high/low); fall back to sector_stocks
     stock_data_ref = stock_data_all if stock_data_all is not None else sector_stocks
     today_ref      = latest_date
@@ -490,12 +620,14 @@ def select_stocks(sector_stocks, available_cash, latest_date, sector=None,
             p20 = hist30["close"].iloc[-21]
             if p20 > 0: mom = (price - p20) / p20
 
-        # Volume accumulation score (used by VOL_RANK / VOL_LEADERS)
+        # Volume accumulation score (used by VOL_RANK / VOL_LEADERS fallback)
         vs = _vol_score_from_df(df, latest_date)
+        # Full-candle score (used by VOL_LEADERS when USE_FULL_CANDLE=True)
+        fc = _full_candle_score_from_df(df, latest_date)
 
         candidates.append({"ticker": ticker, "price": price,
                             "median_val": median_val, "mom_20d": mom,
-                            "vol_score": vs})
+                            "vol_score": vs, "full_candle_score": fc})
 
     if not candidates: return []
 
@@ -505,21 +637,36 @@ def select_stocks(sector_stocks, available_cash, latest_date, sector=None,
     sec_method = SECTOR_STOCK_SELECTION.get(sector, "MOM_BOT50")
 
     if sec_method in ("VOL_LEADERS", "VOL_RANK"):
-        # Rank by volume accumulation — leaders first
-        df_vs = df_c.dropna(subset=["vol_score"])
+        # VOL_LEADERS: rank by full-candle score if enabled, else vol_score
+        # VOL_RANK: always rank by vol_score (top 50%)
+        if VOL_LEADERS_USE_FULL_CANDLE and sec_method == "VOL_LEADERS":
+            rank_col = "full_candle_score"
+        else:
+            rank_col = "vol_score"
+        df_vs = df_c.dropna(subset=[rank_col])
         if len(df_vs) >= 2:
-            df_vs = df_vs.sort_values("vol_score", ascending=False)
+            df_vs = df_vs.sort_values(rank_col, ascending=False)
             if sec_method == "VOL_LEADERS":
                 n_keep = min(VOL_LEADERS_N, max(len(df_vs) // 2, 2))
             else:   # VOL_RANK: top 50%
                 n_keep = max(len(df_vs) // 2, 3)
             df_c = df_vs.head(n_keep).copy()
-        # fallback: if too few vol scores, use all candidates
+        # fallback: if too few scores, use all candidates
     else:
         # MOM_BOT50: keep bottom half by 20d momentum (most oversold)
         df_v = df_c.dropna(subset=["mom_20d"])
         if len(df_v) >= 4:
             df_c = df_v[df_v["mom_20d"] <= df_v["mom_20d"].median()].copy()
+
+    # ── DEMAND_EARLY late-entry filter ────────────────────────────
+    # Skip stocks that already ran >DEMAND_EARLY_MAX_MOM_PCT in 20 days.
+    # These are the "leaders" that created the heat signal — they have
+    # limited remaining upside to the 25% TP.  Buy the laggards instead.
+    if demand_mode and DEMAND_EARLY_MAX_MOM_PCT is not None:
+        mom_ok = df_c["mom_20d"].isna() | (df_c["mom_20d"] <= DEMAND_EARLY_MAX_MOM_PCT)
+        filtered = df_c[mom_ok]
+        if not filtered.empty:
+            df_c = filtered   # only apply if at least one stock passes
 
     # Participation cap iteration
     included = df_c.to_dict("records")
@@ -532,8 +679,10 @@ def select_stocks(sector_stocks, available_cash, latest_date, sector=None,
 
     if not included: return []
 
-    # Sort for display: vol methods → highest vol_score first; MOM → most oversold first
-    if sec_method in ("VOL_LEADERS", "VOL_RANK"):
+    # Sort for display: VOL_LEADERS → full_candle or vol_score; VOL_RANK → vol_score; MOM → momentum
+    if sec_method == "VOL_LEADERS" and VOL_LEADERS_USE_FULL_CANDLE:
+        included.sort(key=lambda x: -(x.get("full_candle_score") or -99))
+    elif sec_method in ("VOL_LEADERS", "VOL_RANK"):
         included.sort(key=lambda x: -(x.get("vol_score") or -99))
     else:
         included.sort(key=lambda x: x.get("mom_20d", 0))
@@ -689,6 +838,110 @@ def plot_cycle_line_chart(sector_signals, output_path, focus_sector=None, show_c
 # MAIN
 # ═════════════════════════════════════════════════════════════════
 
+def demand_scanner(stock_data, sector_data, latest_date, window=20, top_n=8):
+    """
+    Scan all stocks for recent demand signals over the last `window` trading days.
+
+    Per stock: full-candle score (body_pct × body_ratio, recency-weighted),
+    momentum over the window, and volume ratio (recent vs baseline).
+
+    Returns:
+      sector_heat : dict  sector → avg full-candle score across all stocks
+      top_stocks  : list of dicts sorted by full-candle score (all sectors)
+    """
+    ticker_to_sector = {}
+    for sec, stocks in sector_data.items():
+        for t in stocks:
+            ticker_to_sector[t] = sec
+
+    MIN_DAYS_TRADED   = int(window * 0.75)   # must trade ≥75% of window days
+    MIN_CANDLE_TURNOVER = MIN_LIQUIDITY_VND  # best candle day turnover ≥ 1B VND
+
+    rows = []
+    for ticker, df in stock_data.items():
+        sec = ticker_to_sector.get(ticker)
+        if sec is None:
+            continue
+        hist = df[df.index <= latest_date]
+        if len(hist) < window + 5:
+            continue
+        if "high" not in hist.columns or "low" not in hist.columns:
+            continue
+
+        recent = hist.tail(window)
+
+        # ── Liquidity filters ──────────────────────────────────────
+        # 1. Median daily turnover over last 60d must meet threshold
+        med_turnover = (hist["close"] * hist["volume"] * 1000).tail(60).median()
+        if med_turnover < MIN_LIQUIDITY_VND:
+            continue
+
+        # 2. Stock must have traded on most days in the window (no ghost stocks)
+        days_with_vol = (recent["volume"] > 0).sum()
+        if days_with_vol < MIN_DAYS_TRADED:
+            continue
+
+        # Full-candle score: body_pct × body_ratio per bullish bar, recency-weighted
+        scores = []
+        best_body_pct   = 0.0
+        best_turnover   = 0.0
+        for _, row in recent.iterrows():
+            body     = row["close"] - row["open"]
+            rng      = row["high"]  - row["low"]
+            turnover = row["close"] * row["volume"] * 1000
+            if body > 0 and rng > 0 and row["open"] > 0:
+                s = (body / row["open"]) * (body / rng)
+                scores.append(s)
+                if s > best_body_pct:
+                    best_body_pct = s
+                    best_turnover = turnover
+            else:
+                scores.append(0.0)
+
+        # 3. Best candle day must itself have meaningful turnover
+        if best_turnover < MIN_CANDLE_TURNOVER:
+            continue
+
+        weights  = np.arange(1, len(scores) + 1, dtype=float)
+        fc_score = float(np.average(scores, weights=weights))
+
+        # Price momentum over the window
+        p_start = hist.iloc[-(window+1)]["close"] if len(hist) > window else hist.iloc[0]["close"]
+        p_end   = hist.iloc[-1]["close"]
+        mom     = (p_end / p_start - 1) * 100 if p_start > 0 else 0.0
+
+        # Volume ratio: avg volume in window vs prior 60-day baseline
+        baseline_vol = hist.iloc[-(window+60):-(window)]["volume"].mean() if len(hist) >= window + 60 else hist["volume"].mean()
+        recent_vol   = recent["volume"].mean()
+        vol_ratio    = recent_vol / baseline_vol if baseline_vol > 0 else 1.0
+
+        rows.append({
+            "ticker":    ticker,
+            "sector":    sec,
+            "fc_score":  fc_score,
+            "best_candle": best_body_pct,
+            "mom_pct":   mom,
+            "vol_ratio": vol_ratio,
+            "price":     p_end,
+        })
+
+    if not rows:
+        return {}, []
+
+    rows.sort(key=lambda x: -x["fc_score"])
+
+    # Sector heat: average fc_score weighted by top half of stocks per sector
+    sector_heat = {}
+    for sec in sector_data:
+        sec_rows = [r for r in rows if r["sector"] == sec]
+        if not sec_rows:
+            continue
+        top_half = sec_rows[:max(len(sec_rows)//2, 1)]
+        sector_heat[sec] = np.mean([r["fc_score"] for r in top_half])
+
+    return sector_heat, rows[:top_n * len(sector_data)]   # top N per sector worth
+
+
 def main():
     today_str = date.today().strftime("%Y-%m-%d")
     lines = []
@@ -730,14 +983,68 @@ def main():
     p(f"  Strategy: MOM_BOT50 + TRANCHE2 (50%/50%, 3 trading days apart)")
     p("═" * 70)
 
+    # ─── 0. DEMAND SCANNER (last 20 trading days ≈ 1 month) ───────
+    SCAN_WINDOW = 20
+    sector_heat, hot_stocks = demand_scanner(
+        stock_data, sector_data, latest_date, window=SCAN_WINDOW, top_n=6)
+
+    p()
+    p("━" * 70)
+    p(f"  [0] DEMAND SCANNER  —  last {SCAN_WINDOW} trading days")
+    p("━" * 70)
+    p(f"  Ranks stocks by full-candle score (conviction buying: large body, no wicks).")
+    p(f"  Higher score = stronger institutional demand recently.")
+    p()
+
+    # Sector heat bar
+    p(f"  SECTOR HEAT  (avg full-candle score, top-50% of stocks per sector)")
+    max_heat = max(sector_heat.values()) if sector_heat else 1.0
+    for sec in sorted(sector_heat, key=lambda s: -sector_heat[s]):
+        h     = sector_heat[sec]
+        bar   = "█" * max(1, int(h / max(max_heat, 0.001) * 20))
+        arrow = "🔥" if h == max(sector_heat.values()) else "  "
+        p(f"  {arrow} {sec:<22}  {h:.4f}  {bar}")
+    p()
+
+    # Top stocks table
+    p(f"  TOP STOCKS BY DEMAND  (sorted by full-candle score)")
+    p(f"  {'Ticker':<8} {'Sector':<16} {'FC Score':>9} {'Best Candle':>11} {'1M Mom%':>8} {'Vol Ratio':>10}")
+    p(f"  {'-'*66}")
+    shown = 0
+    last_sec = None
+    for r in hot_stocks:
+        if shown >= 30:
+            break
+        if r["sector"] != last_sec:
+            if last_sec is not None:
+                p()
+            last_sec = r["sector"]
+        tag = "🔥" if r["fc_score"] >= 0.01 else "  "
+        p(f"  {tag}{r['ticker']:<7} {r['sector']:<16} {r['fc_score']:>9.4f} "
+          f"{r['best_candle']*100:>10.1f}%  {r['mom_pct']:>+7.1f}%  {r['vol_ratio']:>8.2f}x")
+        shown += 1
+    p()
+    p(f"  Best candle: largest single-day body_pct × body_ratio in the window.")
+    p(f"  Vol ratio  : recent {SCAN_WINDOW}d avg volume vs prior 60d baseline.")
+
     # ─── 1. SECTOR DASHBOARD ──────────────────────────────────────
     p()
     p("━" * 70)
     p("  [1] SECTOR DASHBOARD")
     p("━" * 70)
-    p(f"  {'Sector':<22} {'State':<11} {'Spread':>8} {'Vel':>5} {'Rising':>7} {'Score':>7}  {'Baseline':>10}  {'Early V3':>10}")
-    p(f"  {'-'*90}")
+    p(f"  {'Sector':<22} {'State':<11} {'Spread':>8} {'Vel':>5} {'Rising':>7} {'Score':>7}  {'Baseline':>10}  {'Early V3':>10}  {'Demand':>10}")
+    p(f"  {'-'*103}")
     sector_rows = {}
+    # Pre-compute sector heat and adaptive threshold for all sectors
+    sector_heat_now   = {}
+    sector_heat_thresh = {}
+    if DEMAND_EARLY_ENABLED:
+        for sec in sector_data:
+            sector_heat_now[sec] = _demand_heat(
+                sector_data.get(sec, {}), latest_date,
+                window=DEMAND_HEAT_WINDOW)
+            sector_heat_thresh[sec] = _adaptive_heat_threshold(
+                sector_data.get(sec, {}), latest_date)
     for sec in sorted(sector_signals):
         sig  = sector_signals[sec]
         row  = sig.iloc[-1]
@@ -753,7 +1060,15 @@ def main():
         early_str = f"⚡ EARLY"  if entry_ok_early(row, sec) else \
                     (f"{EARLY_V3_VEL_DAYS-rs}d more" if st=="DROWNING" and sp>EARLY_V3_THRESHOLD and rs>0
                      else "—")
-        p(f"  {sec:<22} {flag} {st:<9}  {sp:>7.1f}  {vel:>+4.1f}  {rs:>5}d  {sc:>7.2f}  {base_str:>10}  {early_str:>10}")
+        heat       = sector_heat_now.get(sec, 0.0)
+        heat_thr   = sector_heat_thresh.get(sec, DEMAND_HEAT_THRESHOLD)
+        demand_ok  = (DEMAND_EARLY_ENABLED and st == "DROWNING"
+                      and sp >= DEMAND_HEAT_SPREAD_FLOOR
+                      and heat >= heat_thr)
+        demand_str = (f"🔥 {heat:.4f}" if demand_ok
+                      else f"{heat:.4f}" if heat > 0
+                      else "—")
+        p(f"  {sec:<22} {flag} {st:<9}  {sp:>7.1f}  {vel:>+4.1f}  {rs:>5}d  {sc:>7.2f}  {base_str:>10}  {early_str:>10}  {demand_str:>10}")
         sector_rows[sec] = row
     p()
     p(f"  Current position: {HELD_SECTOR or 'CASH'}"
@@ -909,7 +1224,8 @@ def main():
 
             if stocks:
                 _bm = SECTOR_STOCK_SELECTION.get(best_sec, "MOM_BOT50")
-                _sort_lbl = ("vol_score ↓ (leaders)" if _bm in ("VOL_LEADERS","VOL_RANK")
+                _sort_lbl = ("full-candle score ↓" if (_bm == "VOL_LEADERS" and VOL_LEADERS_USE_FULL_CANDLE)
+                             else "vol_score ↓ (leaders)" if _bm in ("VOL_LEADERS","VOL_RANK")
                              else "20d momentum (most oversold)")
                 p(f"  STOCKS TO BUY TOMORROW (T1 — {t1_cash/1e6:.1f}M VND):")
                 p(f"  Method: {_bm}  |  Sorted by {_sort_lbl}")
@@ -1030,6 +1346,150 @@ def main():
             else:
                 p(f"  ⚠️  No eligible stocks found — check liquidity or data")
 
+        # ── 5C: DEMAND_EARLY signal ───────────────────────────────
+        if DEMAND_EARLY_ENABLED:
+            p()
+            mode_str = (f"adaptive {DEMAND_HEAT_PERCENTILE}th-pct of 252d history"
+                        if DEMAND_HEAT_USE_ADAPTIVE
+                        else f"fixed ≥ {DEMAND_HEAT_THRESHOLD:.3f}")
+            p(f"  ── DEMAND EARLY (stock flow — heat threshold: {mode_str}) " + "─" * 5)
+            p("  Logic: liquid stocks show conviction buying (big full candles)")
+            p("  while sector is still DROWNING. Enters earlier than Early V3.")
+            p("  WFO validated: 5/5 windows beat baseline Sharpe.")
+            p()
+
+            demand_candidates = {}
+            for sec, row in sector_rows.items():
+                if row is None: continue
+                sp = float(row["spread"])
+                if row["state"] != "DROWNING": continue
+                if sp < DEMAND_HEAT_SPREAD_FLOOR: continue
+                if entry_ok(row, sec) or entry_ok_early(row, sec): continue
+                heat     = sector_heat_now.get(sec, 0.0)
+                heat_thr = sector_heat_thresh.get(sec, DEMAND_HEAT_THRESHOLD)
+                if heat >= heat_thr:
+                    demand_candidates[sec] = heat
+
+            if not demand_candidates:
+                # Show current heat for all DROWNING sectors
+                watching = [(sec, sector_heat_now.get(sec, 0.0),
+                             sector_heat_thresh.get(sec, DEMAND_HEAT_THRESHOLD))
+                            for sec, row in sector_rows.items()
+                            if row is not None and row["state"] == "DROWNING"]
+                if watching:
+                    p("  ⏳ NO DEMAND SIGNAL — heat below adaptive threshold:")
+                    p(f"  {'Sector':<22} {'Heat':>8} {'Thresh':>8}  Progress")
+                    p(f"  {'-'*60}")
+                    for sec, h, thr in sorted(watching, key=lambda x: -x[1]):
+                        bar  = "█" * int(min(h / max(thr, 1e-6), 1.0) * 15)
+                        gap  = max(0.0, thr - h)
+                        p(f"  {sec:<22} {h:>8.4f} {thr:>8.4f}  {bar}  need +{gap:.4f}")
+                else:
+                    p("  ⏳ NO DROWNING SECTORS — demand signal not applicable")
+            else:
+                best_demand = max(demand_candidates, key=demand_candidates.get)
+                t1_cash = TOTAL_CAPITAL_VND * TRANCHE1_FRAC
+                t2_cash = TOTAL_CAPITAL_VND * TRANCHE2_FRAC
+                for sec, heat in sorted(demand_candidates.items(),
+                                        key=lambda x: -x[1]):
+                    star = "  ← BEST" if sec == best_demand else ""
+                    row  = sector_rows[sec]
+                    p(f"  🔥 DEMAND SIGNAL — {sec}{star}")
+                    thr_disp = sector_heat_thresh.get(sec, DEMAND_HEAT_THRESHOLD)
+                    p(f"     Heat: {heat:.4f} (threshold {thr_disp:.4f} adaptive)  |  "
+                      f"Spread: {float(row['spread']):.1f}  |  State: DROWNING")
+                p()
+                p(f"  Best candidate: {best_demand}")
+                p(f"  EXECUTION PLAN: same as baseline — T1 tomorrow, T2 in 3 days")
+                p(f"  ⚠️  Entering BEFORE breadth confirmation — higher risk, earlier price.")
+                p()
+                stocks = select_stocks(sector_data.get(best_demand, {}), t1_cash,
+                                       today_date, sector=best_demand,
+                                       stock_data_all=stock_data,
+                                       demand_mode=True)
+                if stocks:
+                    p(f"  STOCKS TO BUY TOMORROW — {best_demand} (T1 — {t1_cash/1e6:.1f}M VND):")
+                    p(f"  {'#':<4} {'Ticker':<8} {'Price':>7} {'Shares':>8} "
+                      f"{'Cost (M)':>9} {'Mom20d':>8}  TP @    Kijun entry guidance")
+                    p(f"  {'-'*90}")
+                    for i, s in enumerate(stocks, 1):
+                        kij   = s.get("kijun_info", {})
+                        ready = "✅ BUY " if kij.get("ready", True) else "⏳ WAIT"
+                        klbl  = kij.get("label", "—")
+                        p(f"  {i:<4} {s['ticker']:<8} {s['price']:>7.2f}  {s['shares']:>8,}"
+                          f"  {s['cost_vnd']/1e6:>8.2f}M  {s['mom_20d']*100:>+7.1f}%"
+                          f"  {s['tp_price']:>6.2f}  {ready} {klbl}")
+                    total = sum(s["cost_vnd"] for s in stocks)
+                    p(f"  {'':4} {'TOTAL':<8} {'':>7}  {sum(s['shares'] for s in stocks):>8,}"
+                      f"  {total/1e6:>8.2f}M")
+                else:
+                    p(f"  ⚠️  No eligible stocks found")
+
+    # ─── FINAL DECISION (single action summary) ──────────────────
+    p()
+    p("=" * 70)
+    p("  [6] FINAL DECISION — WHAT TO DO TODAY")
+    p("=" * 70)
+    # Determine which signal (if any) is the actual action
+    # Priority: BASELINE > EARLY_V3 > DEMAND_EARLY (same as backtest)
+    _action_sec   = None
+    _action_type  = None
+    _action_stocks = []
+
+    if HELD_SECTOR:
+        _action_type = "HOLD"
+        p(f"  HOLD {HELD_SECTOR} — you are already in a position.")
+        p(f"  Check [2] EXIT CHECK and [4] TAKE-PROFIT above for any action needed.")
+    else:
+        # Check what fired (re-use variables from above sections)
+        if 'best_sec' in dir() and candidates:
+            _action_sec  = best_sec
+            _action_type = "BASELINE"
+        elif 'best_early' in dir() and early_candidates:
+            _action_sec  = best_early
+            _action_type = "EARLY_V3"
+        elif 'best_demand' in dir() and demand_candidates:
+            _action_sec  = best_demand
+            _action_type = "DEMAND_EARLY"
+
+        if _action_type is None or _action_sec is None:
+            p("  ACTION : STAY IN CASH")
+            p("  REASON : No sector signal has fired (baseline, early, or demand).")
+            p("  WATCH  : Check again tomorrow.")
+        else:
+            icons = {"BASELINE": "🟢", "EARLY_V3": "⚡", "DEMAND_EARLY": "🔥"}
+            risks = {
+                "BASELINE":     "Confirmed recovery — standard risk.",
+                "EARLY_V3":     "Pre-signal — sector still DROWNING. Lower win rate (~42%).",
+                "DEMAND_EARLY": "Earliest entry — sector DROWNING but heat is high. Highest risk, best price.",
+            }
+            t1c = TOTAL_CAPITAL_VND * TRANCHE1_FRAC
+            t2c = TOTAL_CAPITAL_VND * TRANCHE2_FRAC
+            p(f"  ACTION : {icons[_action_type]} BUY {_action_sec}  [{_action_type}]")
+            p(f"  RISK   : {risks[_action_type]}")
+            p(f"  CAPITAL: T1 = {t1c/1e6:.1f}M VND tomorrow open")
+            p(f"           T2 = {t2c/1e6:.1f}M VND in 3 trading days")
+            p(f"           (skip T2 if sector spread < 0 on T2 day)")
+            p()
+            p(f"  WHY NOT the others?")
+            if _action_type == "BASELINE":
+                p(f"    EARLY_V3 / DEMAND_EARLY: baseline already confirmed — no need to go earlier.")
+            elif _action_type == "EARLY_V3":
+                p(f"    BASELINE: not confirmed yet (spread below threshold).")
+                if 'best_demand' in dir() and demand_candidates:
+                    p(f"    DEMAND_EARLY ({best_demand}): EARLY_V3 fired first — backtest priority goes to EARLY_V3.")
+                    p(f"    Different sector shown in [5C] — ignore it, only one sector at a time.")
+            elif _action_type == "DEMAND_EARLY":
+                p(f"    BASELINE / EARLY_V3: neither has fired yet.")
+            p()
+            p(f"  SELL when (check daily):")
+            p(f"    • Any stock hits +25% gain  → sell that stock next open")
+            p(f"    • Sector spread drops < {SPREAD_EXIT}  → exit ALL stocks next open")
+            p(f"    • Sector state = PEAKING    → exit ALL stocks next open")
+            p(f"    • 20d momentum < -5%        → exit ALL stocks next open")
+            p(f"    DEMAND_EARLY uses identical exit rules as baseline — no difference.")
+    p("=" * 70)
+
     # ─── FOOTER ──────────────────────────────────────────────────
     p()
     p("━" * 70)
@@ -1048,41 +1508,74 @@ def main():
     with open(fname, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     print(f"\n  → Saved to {fname}")
+    return lines
+
+
+def _parse_capital(arg):
+    """
+    Parse a capital string into an integer VND amount.
+    Accepts:  10m  100m  1b  1.5b  5000000  50_000_000
+    Examples:
+      10m  -> 10_000_000
+      100m -> 100_000_000
+      1b   -> 1_000_000_000
+      1.5b -> 1_500_000_000
+    """
+    s = arg.strip().lower().replace(",", "").replace("_", "")
+    if s.endswith("b"):
+        return int(float(s[:-1]) * 1_000_000_000)
+    elif s.endswith("m"):
+        return int(float(s[:-1]) * 1_000_000)
+    elif s.endswith("k"):
+        return int(float(s[:-1]) * 1_000)
+    else:
+        return int(float(s))
 
 
 if __name__ == "__main__":
-    run_started = datetime.now()
-    status = "SUCCESS"
-    err_text = ""
-    report_path = ""
+    # Optional CLI args:  python 4Sectorlivesignals_github_telegram.py [capital]
+    #   e.g.  10m  100m  1b  1.5b
+    import sys as _sys
+    if len(_sys.argv) >= 2:
+        try:
+            TOTAL_CAPITAL_VND = _parse_capital(_sys.argv[1])
+            print(f"  Capital set from CLI: {TOTAL_CAPITAL_VND:,.0f} VND "
+                  f"({_sys.argv[1].upper()})")
+        except ValueError:
+            print(f"  WARNING: could not parse '{_sys.argv[1]}' as capital — "
+                  f"using default {TOTAL_CAPITAL_VND:,.0f} VND")
+
+    run_started  = datetime.now()
+    status       = "SUCCESS"
+    err_text     = ""
+    report_lines = []
 
     try:
-        main()
-        today_str = date.today().strftime("%Y-%m-%d")
-        report_path = os.path.join(REPORTS_DIR, f"signals_{today_str}.txt")
+        report_lines = main()
     except Exception:
-        status = "FAILED"
+        status   = "FAILED"
         err_text = traceback.format_exc(limit=5)
         print(err_text)
 
-    elapsed = (datetime.now() - run_started).total_seconds()
-    host = os.getenv("GITHUB_REPOSITORY", "local-run")
-    workflow = os.getenv("GITHUB_WORKFLOW", "manual")
+    elapsed  = (datetime.now() - run_started).total_seconds()
+    host     = os.getenv("GITHUB_REPOSITORY", "local-run")
+    workflow = os.getenv("GITHUB_WORKFLOW",   "manual")
 
-    summary_lines = [
-        f"📊 4Sector Live Signals: {status}",
-        f"Repo: {host}",
-        f"Workflow: {workflow}",
-        f"Date: {date.today().isoformat()}",
-        f"Duration: {elapsed:.1f}s",
+    summary = [
+        f"4Sector Live Signals: {status}",
+        f"Repo: {host}  |  Workflow: {workflow}",
+        f"Date: {date.today().isoformat()}  |  Duration: {elapsed:.1f}s",
     ]
-    if report_path:
-        summary_lines.append(f"Report: {report_path}")
     if err_text:
-        summary_lines.append("Error:")
-        summary_lines.append(err_text[-1200:])
+        summary += ["Error:", err_text[-1200:]]
 
-    send_telegram_message("\n".join(summary_lines))
+    send_telegram_message("\n".join(summary))
+    if status == "SUCCESS" and report_lines:
+        send_telegram_report_chunks(report_lines)
 
     if status != "SUCCESS":
         raise SystemExit(1)
+
+    # Only pause when run interactively (not via GitHub Actions / cron)
+    if sys.stdin.isatty():
+        input("\nPress Enter to exit...")
