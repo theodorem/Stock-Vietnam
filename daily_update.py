@@ -56,18 +56,19 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 def send_telegram_message(message):
     """Send a Telegram message when bot token/chat id are configured."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(" Telegram chưa cấu hình (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID). Bỏ qua gửi thông báo.")
+        print("⚠️  Telegram chưa cấu hình (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID). Bỏ qua gửi thông báo.")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": int(TELEGRAM_CHAT_ID),  # Convert to integer
         "text": message,
+        "parse_mode": "HTML"  # Optional: enable HTML formatting
     }
     try:
         r = requests.post(url, json=payload, timeout=15)
         r.raise_for_status()
-        print(" Đã gửi thông báo Telegram.")
+        print("✅ Đã gửi thông báo Telegram.")
     except Exception as e:
         print(f"❌ Gửi Telegram thất bại: {e}")
 
