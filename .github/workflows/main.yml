@@ -26,14 +26,15 @@ jobs:
           pip install pandas requests vnstock pyarrow
 
       - name: Run update script
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python daily_update.py
 
       - name: Commit and Push changes
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "Auto-update daily stock data [$(date +'%Y-%m-%d')]"
-          # Use '.' to ensure it grabs all new/modified files in any folder
           file_pattern: '.'
-          # Ensure it uses the correct user to avoid permission errors
           commit_user_name: github-actions[bot]
           commit_user_email: github-actions[bot]@users.noreply.github.com
