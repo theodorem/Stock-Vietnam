@@ -2,7 +2,7 @@ name: Daily Data Update
 
 on:
   schedule:
-    - cron: '0 10 * * 1-5' # 17:00 VN Time
+    - cron: '0 9 * * 1-5' # 17:00 VN Time
   workflow_dispatch:
 
 permissions:
