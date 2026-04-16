@@ -1314,7 +1314,7 @@ def main():
                   f"  |  Rising: {rs} consecutive days  |  Velocity: {vel:+.2f}")
 
             p()
-            p(f"  Best early candidate: {best_early}")
+            p(f"  Best early candidate: {best_early}  (highest spread = closest to recovery)")
             p(f"  EXECUTION PLAN (TRANCHE2 — same as baseline):")
             p(f"  ┌─ T1: {TRANCHE1_FRAC*100:.0f}% = {t1_cash/1e6:.1f}M VND → buy at TOMORROW's open")
             p(f"  └─ T2: {TRANCHE2_FRAC*100:.0f}% = {t2_cash/1e6:.1f}M VND → 3 trading days later")
@@ -1323,28 +1323,32 @@ def main():
             p(f"  ⚠️  NOTE: You are entering BEFORE confirmed recovery.")
             p(f"     The spread is still negative — baseline has NOT fired yet.")
             p(f"     Expected: lower entry price, lower win rate (~42%), higher reward if right.")
-            p()
 
-            stocks = select_stocks(sector_data.get(best_early, {}), t1_cash, today_date,
-                                   sector=best_early, stock_data_all=stock_data)
-            if stocks:
-                p(f"  STOCKS TO BUY TOMORROW — {best_early} (T1 — {t1_cash/1e6:.1f}M VND):")
+            # Show stock lists for ALL firing sectors so you can compare
+            for sec, row in sorted(early_candidates.items(),
+                                   key=lambda x: -float(x[1]["spread"])):
+                star = "  ← BEST (execute this one)" if sec == best_early else ""
+                p()
+                p(f"  STOCKS — {sec} (T1 — {t1_cash/1e6:.1f}M VND){star}")
                 p(f"  {'#':<4} {'Ticker':<8} {'Price':>7} {'Shares':>8} "
                   f"{'Cost (M)':>9} {'Mom20d':>8}  TP @    Kijun entry guidance")
                 p(f"  {'-'*90}")
-                for i, s in enumerate(stocks, 1):
-                    kij   = s.get("kijun_info", {})
-                    ready = "✅ BUY " if kij.get("ready", True) else "⏳ WAIT"
-                    klbl  = kij.get("label", "—")
-                    note  = "  ← most oversold" if i == 1 else ""
-                    p(f"  {i:<4} {s['ticker']:<8} {s['price']:>7.2f}  {s['shares']:>8,}"
-                      f"  {s['cost_vnd']/1e6:>8.2f}M  {s['mom_20d']*100:>+7.1f}%"
-                      f"  {s['tp_price']:>6.2f}  {ready} {klbl}{note}")
-                total = sum(s["cost_vnd"] for s in stocks)
-                p(f"  {'':4} {'TOTAL':<8} {'':>7}  {sum(s['shares'] for s in stocks):>8,}"
-                  f"  {total/1e6:>8.2f}M")
-            else:
-                p(f"  ⚠️  No eligible stocks found — check liquidity or data")
+                stocks = select_stocks(sector_data.get(sec, {}), t1_cash, today_date,
+                                       sector=sec, stock_data_all=stock_data)
+                if stocks:
+                    for i, s in enumerate(stocks, 1):
+                        kij   = s.get("kijun_info", {})
+                        ready = "✅ BUY " if kij.get("ready", True) else "⏳ WAIT"
+                        klbl  = kij.get("label", "—")
+                        note  = "  ← most oversold" if i == 1 else ""
+                        p(f"  {i:<4} {s['ticker']:<8} {s['price']:>7.2f}  {s['shares']:>8,}"
+                          f"  {s['cost_vnd']/1e6:>8.2f}M  {s['mom_20d']*100:>+7.1f}%"
+                          f"  {s['tp_price']:>6.2f}  {ready} {klbl}{note}")
+                    total = sum(s["cost_vnd"] for s in stocks)
+                    p(f"  {'':4} {'TOTAL':<8} {'':>7}  {sum(s['shares'] for s in stocks):>8,}"
+                      f"  {total/1e6:>8.2f}M")
+                else:
+                    p(f"  ⚠️  No eligible stocks found — check liquidity or data")
 
         # ── 5C: DEMAND_EARLY signal ───────────────────────────────
         if DEMAND_EARLY_ENABLED:
@@ -1399,31 +1403,38 @@ def main():
                     p(f"     Heat: {heat:.4f} (threshold {thr_disp:.4f} adaptive)  |  "
                       f"Spread: {float(row['spread']):.1f}  |  State: DROWNING")
                 p()
-                p(f"  Best candidate: {best_demand}")
+                p(f"  Best candidate: {best_demand}  (highest heat score)")
                 p(f"  EXECUTION PLAN: same as baseline — T1 tomorrow, T2 in 3 days")
                 p(f"  ⚠️  Entering BEFORE breadth confirmation — higher risk, earlier price.")
-                p()
-                stocks = select_stocks(sector_data.get(best_demand, {}), t1_cash,
-                                       today_date, sector=best_demand,
-                                       stock_data_all=stock_data,
-                                       demand_mode=True)
-                if stocks:
-                    p(f"  STOCKS TO BUY TOMORROW — {best_demand} (T1 — {t1_cash/1e6:.1f}M VND):")
+
+                # Show stock lists for ALL firing demand sectors
+                for sec, heat in sorted(demand_candidates.items(),
+                                        key=lambda x: -x[1]):
+                    star = "  ← BEST (execute this one)" if sec == best_demand else ""
+                    thr_disp = sector_heat_thresh.get(sec, DEMAND_HEAT_THRESHOLD)
+                    p()
+                    p(f"  STOCKS — {sec}  heat={heat:.4f} thr={thr_disp:.4f}"
+                      f"  (T1 — {t1_cash/1e6:.1f}M VND){star}")
                     p(f"  {'#':<4} {'Ticker':<8} {'Price':>7} {'Shares':>8} "
                       f"{'Cost (M)':>9} {'Mom20d':>8}  TP @    Kijun entry guidance")
                     p(f"  {'-'*90}")
-                    for i, s in enumerate(stocks, 1):
-                        kij   = s.get("kijun_info", {})
-                        ready = "✅ BUY " if kij.get("ready", True) else "⏳ WAIT"
-                        klbl  = kij.get("label", "—")
-                        p(f"  {i:<4} {s['ticker']:<8} {s['price']:>7.2f}  {s['shares']:>8,}"
-                          f"  {s['cost_vnd']/1e6:>8.2f}M  {s['mom_20d']*100:>+7.1f}%"
-                          f"  {s['tp_price']:>6.2f}  {ready} {klbl}")
-                    total = sum(s["cost_vnd"] for s in stocks)
-                    p(f"  {'':4} {'TOTAL':<8} {'':>7}  {sum(s['shares'] for s in stocks):>8,}"
-                      f"  {total/1e6:>8.2f}M")
-                else:
-                    p(f"  ⚠️  No eligible stocks found")
+                    stocks = select_stocks(sector_data.get(sec, {}), t1_cash,
+                                           today_date, sector=sec,
+                                           stock_data_all=stock_data,
+                                           demand_mode=True)
+                    if stocks:
+                        for i, s in enumerate(stocks, 1):
+                            kij   = s.get("kijun_info", {})
+                            ready = "✅ BUY " if kij.get("ready", True) else "⏳ WAIT"
+                            klbl  = kij.get("label", "—")
+                            p(f"  {i:<4} {s['ticker']:<8} {s['price']:>7.2f}  {s['shares']:>8,}"
+                              f"  {s['cost_vnd']/1e6:>8.2f}M  {s['mom_20d']*100:>+7.1f}%"
+                              f"  {s['tp_price']:>6.2f}  {ready} {klbl}")
+                        total = sum(s["cost_vnd"] for s in stocks)
+                        p(f"  {'':4} {'TOTAL':<8} {'':>7}  {sum(s['shares'] for s in stocks):>8,}"
+                          f"  {total/1e6:>8.2f}M")
+                    else:
+                        p(f"  ⚠️  No eligible stocks found")
 
     # ─── FINAL DECISION (single action summary) ──────────────────
     p()
@@ -1533,17 +1544,13 @@ def _parse_capital(arg):
 
 
 if __name__ == "__main__":
-    # Optional CLI args:  python 4Sectorlivesignals_github_telegram.py [capital]
-    #   e.g.  10m  100m  1b  1.5b
     import sys as _sys
     if len(_sys.argv) >= 2:
         try:
             TOTAL_CAPITAL_VND = _parse_capital(_sys.argv[1])
-            print(f"  Capital set from CLI: {TOTAL_CAPITAL_VND:,.0f} VND "
-                  f"({_sys.argv[1].upper()})")
+            print(f"  Capital set from CLI: {TOTAL_CAPITAL_VND:,.0f} VND ({_sys.argv[1].upper()})")
         except ValueError:
-            print(f"  WARNING: could not parse '{_sys.argv[1]}' as capital — "
-                  f"using default {TOTAL_CAPITAL_VND:,.0f} VND")
+            print(f"  WARNING: could not parse '{_sys.argv[1]}' — using default")
 
     run_started  = datetime.now()
     status       = "SUCCESS"
@@ -1576,6 +1583,5 @@ if __name__ == "__main__":
     if status != "SUCCESS":
         raise SystemExit(1)
 
-    # Only pause when run interactively (not via GitHub Actions / cron)
     if sys.stdin.isatty():
         input("\nPress Enter to exit...")
