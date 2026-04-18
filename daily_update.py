@@ -517,20 +517,46 @@ def _fetch_symbol_trades(symbol, profile):
             break
     return pd.DataFrame(all_trades)
 
-
 def _fetch_and_save_tick(args):
     symbol, out_path, sector, platform, profile_idx, total, position = args
     profile = _TICK_PROFILES[profile_idx % len(_TICK_PROFILES)]
     _tick_log(f"[{position:>3}/{total}] {symbol:>6}  fetching...")
-    df = _fetch_symbol_trades(symbol, profile)
-    if df.empty:
-        _tick_log(f"[{position:>3}/{total}] {symbol:>6}  NO DATA")
+    
+    new_df = _fetch_symbol_trades(symbol, profile)
+    if new_df.empty:
+        _tick_log(f"[{position:>3}/{total}] {symbol:>6}  NO DATA (API returned empty)")
         return symbol, "failed"
-    df.insert(0, "symbol",   symbol)
-    df.insert(1, "sector",   sector)
-    df.insert(2, "platform", platform)
-    df.to_parquet(out_path, index=False, engine="pyarrow")
-    _tick_log(f"[{position:>3}/{total}] {symbol:>6}  OK  {len(df):>6} trades")
+        
+    new_df.insert(0, "symbol",   symbol)
+    new_df.insert(1, "sector",   sector)
+    new_df.insert(2, "platform", platform)
+
+    # --- NEW MERGE LOGIC ---
+    if os.path.exists(out_path):
+        try:
+            # Read existing master file
+            old_df = pd.read_parquet(out_path)
+            
+            # Combine new and old data
+            combined_df = pd.concat([old_df, new_df], ignore_index=True)
+            
+            # Drop exact duplicates to prevent duplicate rows if script runs twice in a day
+            combined_df = combined_df.drop_duplicates()
+            
+            # Optional: sort by time if the API provides it (usually 'time' or 'matchTime')
+            if 'time' in combined_df.columns:
+                combined_df = combined_df.sort_values(by=['time']).reset_index(drop=True)
+                
+            combined_df.to_parquet(out_path, index=False, engine="pyarrow")
+            _tick_log(f"[{position:>3}/{total}] {symbol:>6}  OK  Appended {len(new_df)} trades (Total: {len(combined_df)})")
+        except Exception as e:
+            _tick_log(f"[{position:>3}/{total}] {symbol:>6}  ERR merging file: {e}")
+            return symbol, "failed"
+    else:
+        # Create new master file if it doesn't exist
+        new_df.to_parquet(out_path, index=False, engine="pyarrow")
+        _tick_log(f"[{position:>3}/{total}] {symbol:>6}  OK  Created new file ({len(new_df)} trades)")
+        
     return symbol, "ok"
 
 
@@ -550,20 +576,19 @@ def job_update_tick_data():
     sector_lookup   = sectors.set_index("symbol")["sector"].to_dict()
     platform_lookup = sectors.set_index("symbol")["platform"].to_dict()
 
-    today   = get_today_str()
-    day_dir = os.path.join(DATA_DIR, "tick_data", today)
-    os.makedirs(day_dir, exist_ok=True)
+    # --- CHANGED: Target the master folder, no date sub-folder ---
+    master_dir = os.path.join(DATA_DIR, "tick_data")
+    os.makedirs(master_dir, exist_ok=True)
 
-    pending = [(s, os.path.join(day_dir, f"{s}.parquet"))
-               for s in symbols if not os.path.exists(os.path.join(day_dir, f"{s}.parquet"))]
-    skipped = len(symbols) - len(pending)
-    print(f"{len(symbols)} symbols | {skipped} already done | {len(pending)} to fetch")
+    print(f"{len(symbols)} symbols to update today.")
     print(f"Running {_TICK_WORKERS} parallel sessions\n")
 
+    # --- CHANGED: We fetch for ALL symbols, since we need today's data appended ---
     tasks = [
-        (sym, path, sector_lookup.get(sym, ""), platform_lookup.get(sym, ""),
-         i % _TICK_WORKERS, len(pending), i + 1)
-        for i, (sym, path) in enumerate(pending)
+        (sym, os.path.join(master_dir, f"{sym}.parquet"), 
+         sector_lookup.get(sym, ""), platform_lookup.get(sym, ""),
+         i % _TICK_WORKERS, len(symbols), i + 1)
+        for i, sym in enumerate(symbols)
     ]
 
     ok, failed_syms = 0, []
@@ -584,7 +609,7 @@ def job_update_tick_data():
         retry_wait *= 2
         still_failed = []
         for i, sym in enumerate(failed_syms, 1):
-            out_path = os.path.join(day_dir, f"{sym}.parquet")
+            out_path = os.path.join(master_dir, f"{sym}.parquet")
             task = (sym, out_path, sector_lookup.get(sym, ""), platform_lookup.get(sym, ""), i, len(failed_syms), i)
             _, status = _fetch_and_save_tick(task)
             if status == "ok": ok += 1
@@ -592,11 +617,10 @@ def job_update_tick_data():
             time.sleep(2)
         failed_syms = still_failed
 
-    print(f"\nTick data: {ok} saved | {skipped} skipped | {len(failed_syms)} failed")
+    print(f"\nTick data: {ok} updated | {len(failed_syms)} failed")
     if failed_syms:
         print(f"Failed: {failed_syms}")
-    print(f"Output: {day_dir}")
-
+    print(f"Output: {master_dir}")
 
 # ==============================================================================
 # MAIN EXECUTION
