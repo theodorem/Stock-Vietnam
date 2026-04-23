@@ -623,6 +623,86 @@ def job_update_tick_data():
     print(f"Output: {master_dir}")
 
 # ==============================================================================
+# PHẦN 6: WHALE SIGNAL (INSTITUTIONAL BUYING DETECTOR)
+# ==============================================================================
+def job_whale_signal():
+    print("\n--- [6/6] WHALE SIGNAL ---")
+    if is_weekend():
+        print("Cuoi tuan. Bo qua.")
+        return
+
+    try:
+        from whale_detector import run_analysis, _fmt, _latest_tick_date, _latest_price_date
+    except ImportError as e:
+        print(f"❌ Khong the import whale_detector: {e}")
+        return
+
+    today_iso  = get_today_str()                              # YYYY-MM-DD
+    today_vn   = dt.datetime.now(VN_TZ).strftime("%d/%m/%Y") # dd/mm/YYYY
+
+    # Gracefully fall back to latest available data if today's tick isn't ready yet
+    latest_tick  = _latest_tick_date()
+    latest_price = _latest_price_date()
+    if latest_tick != today_vn:
+        print(f"   ⚠️ Tick chua co ngay hom nay ({today_vn}), dung ngay gan nhat: {latest_tick}")
+        today_vn = latest_tick
+    if latest_price != today_iso:
+        today_iso = latest_price
+
+    print(f"   Phan tich: tick={today_vn}  gia={today_iso}")
+
+    try:
+        results = run_analysis(today_iso=today_iso, today_vn=today_vn, top_n=15)
+    except Exception as e:
+        print(f"❌ Loi whale analysis: {e}")
+        return
+
+    if not results:
+        print("   Khong co tin hieu whale hom nay.")
+        send_telegram_message(f"🐋 WHALE WATCHLIST {today_iso}\n\nKhong co tin hieu ro rang hom nay.")
+        return
+
+    # ── Print to console ──────────────────────────────────────────────────────
+    print(f"\n   TOP {len(results)} WHALE SIGNALS:\n")
+    for i, (sym, score, d) in enumerate(results, 1):
+        print(f"   {_fmt(i, sym, score, d)}")
+
+    # ── Format Telegram message ───────────────────────────────────────────────
+    lines = [f"🐋 <b>WHALE WATCHLIST {today_iso}</b>"]
+    lines.append(f"tick={today_vn}  |  {len(results)} signals\n")
+
+    for i, (sym, score, d) in enumerate(results[:15], 1):
+        # Build a compact signal tag string
+        tags = []
+        if d.get("buy%"):
+            tags.append(f"tick {d['buy%']}%")
+        if d.get("late_buy%") and d["late_buy%"] > 55:
+            tags.append(f"late {d['late_buy%']}%")
+        if d.get("n_blocks"):
+            tags.append(f"{d['n_blocks']} blocks")
+        if d.get("f_net_K") and d["f_net_K"] != 0:
+            tags.append(f"F {d['f_net_K']:+,}K")
+        if d.get("f_streak", 0) >= 2:
+            tags.append(f"streak {d['f_streak']}d")
+        if d.get("td_net_B") is not None and d["td_net_B"] > 0:
+            tags.append(f"TD +{d['td_net_B']:.1f}B")
+        if d.get("pt_deals"):
+            tags.append(f"PT {d['pt_deals']}x")
+        if d.get("vol_x", 1) >= 1.5:
+            tags.append(f"vol {d['vol_x']}x")
+
+        tag_str = " | ".join(tags) if tags else "—"
+        strength = "🟢" if score >= 50 else "🟡" if score >= 30 else "⚪"
+        lines.append(f"{strength} <b>#{i} {sym}</b>  [{score}]  {tag_str}")
+
+    lines.append("\n📊 70+ manh | 50-69 trung binh | 30-49 theo doi")
+    lines.append("⚠️ Xac nhan tren bieu do truoc khi mua.")
+
+    send_telegram_message("\n".join(lines))
+    print(f"\n✅ Da gui whale signal telegram.")
+
+
+# ==============================================================================
 # MAIN EXECUTION
 # ==============================================================================
 if __name__ == "__main__":
@@ -632,6 +712,7 @@ if __name__ == "__main__":
         ("JOB 3 - CAP NHAT TU DOANH", job_update_tudoanh),
         ("JOB 4 - CAP NHAT CHI SO (VNINDEX)", job_update_index),
         ("JOB 5 - CAP NHAT TICK DATA", job_update_tick_data),
+        ("JOB 6 - WHALE SIGNAL", job_whale_signal),
     ]
 
     job_results = []
